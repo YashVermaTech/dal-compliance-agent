@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: dal-compliance-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENV
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: dal-compliance-index
+      - key: GROQ_MODEL
+        value: llama3-70b-8192
+      - key: EMBEDDING_MODEL
+        value: sentence-transformers/all-MiniLM-L6-v2
+      - key: PYTHON_VERSION
+        value: "3.11.0"
