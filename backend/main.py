@@ -51,12 +51,6 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=== DAL-Aware Compliance Agent API starting ===")
-    try:
-        from backend.vector_store.pinecone_client import PineconeClient
-        PineconeClient.get_instance()
-        log.info("[OK] Pinecone client initialized")
-    except Exception as exc:
-        log.warning("[WARN] Pinecone init deferred: %s", exc)
     yield
     log.info("=== API shutting down ===")
 
