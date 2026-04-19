@@ -4,6 +4,8 @@ DAL-Aware Compliance Agent — Pinecone Vector Store Client
 Wraps Pinecone free-tier serverless index for DAL-filtered
 semantic search over aerospace compliance documents.
 
+Uses Pinecone Inference API for embeddings — zero local RAM usage.
+
 Author: Yash Verma — AI Engineer, TU Darmstadt
 """
 
@@ -21,8 +23,7 @@ log = logging.getLogger(__name__)
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_ENV = os.environ.get("PINECONE_ENV", "us-east-1")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX_NAME", "dal-compliance-index")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-DIMENSION = 384  # all-MiniLM-L6-v2 output dimension
+DIMENSION = 1024  # multilingual-e5-large dimension
 
 
 class PineconeClient:
@@ -33,10 +34,14 @@ class PineconeClient:
     - DAL-filtered semantic search
     - Chunk upsert (used by ingest endpoint)
     - Document listing
+    
+    Uses Pinecone Inference API for embeddings instead of
+    local sentence-transformers — runs within 512MB RAM limit.
     """
 
     _instance: PineconeClient | None = None
-    _model = None  # SentenceTransformer singleton
+    _model = None
+    _pc = None  # Pinecone inference client
 
     def __init__(self) -> None:
         self._index = None
@@ -54,7 +59,7 @@ class PineconeClient:
     # ------------------------------------------------------------------
 
     def _init(self) -> None:
-        """Connect to Pinecone and load embedding model."""
+        """Connect to Pinecone index."""
         if not PINECONE_API_KEY:
             log.warning("PINECONE_API_KEY not set — vector search unavailable.")
             return
@@ -62,6 +67,8 @@ class PineconeClient:
             from pinecone import Pinecone, ServerlessSpec
 
             pc = Pinecone(api_key=PINECONE_API_KEY)
+            PineconeClient._pc = pc
+
             existing = [idx.name for idx in pc.list_indexes()]
 
             if PINECONE_INDEX not in existing:
@@ -74,7 +81,6 @@ class PineconeClient:
                 )
 
             self._index = pc.Index(PINECONE_INDEX)
-            self._load_model()
             self._ready = True
             log.info("Pinecone client ready (index: %s)", PINECONE_INDEX)
 
@@ -83,20 +89,35 @@ class PineconeClient:
             self._ready = False
 
     def _load_model(self) -> None:
-        if PineconeClient._model is None:
-            from sentence_transformers import SentenceTransformer
-            log.info("Loading embedding model: %s", EMBEDDING_MODEL)
-            PineconeClient._model = SentenceTransformer(EMBEDDING_MODEL)
+        """Initialize Pinecone inference client."""
+        if PineconeClient._pc is None:
+            from pinecone import Pinecone
+            PineconeClient._pc = Pinecone(api_key=PINECONE_API_KEY)
+            log.info("Pinecone inference client ready")
 
     # ------------------------------------------------------------------
-    # Embedding
+    # Embedding — uses Pinecone Inference API (cloud, zero local RAM)
     # ------------------------------------------------------------------
 
     def _embed(self, text: str) -> list[float]:
-        """Return a normalized embedding for the given text."""
+        """Return embedding using Pinecone Inference API."""
         self._load_model()
-        vec = PineconeClient._model.encode(text, normalize_embeddings=True)
-        return vec.tolist()
+        result = PineconeClient._pc.inference.embed(
+            model="multilingual-e5-large",
+            inputs=[text],
+            parameters={"input_type": "query"}
+        )
+        return result[0].values
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return embeddings for a batch of texts."""
+        self._load_model()
+        result = PineconeClient._pc.inference.embed(
+            model="multilingual-e5-large",
+            inputs=texts,
+            parameters={"input_type": "passage"}
+        )
+        return [r.values for r in result]
 
     # ------------------------------------------------------------------
     # Search
@@ -120,7 +141,7 @@ class PineconeClient:
             top_k:     Max results to return.
 
         Returns:
-            List of result dicts: text, score, filename, section_number, page_number …
+            List of result dicts: text, score, filename, section_number, page_number
         """
         if not self._ready:
             log.warning("Pinecone not ready — returning empty results.")
@@ -146,15 +167,15 @@ class PineconeClient:
 
         return [
             {
-                "chunk_id":      m["id"],
-                "score":         float(m["score"]),
-                "text":          m["metadata"].get("text", ""),
-                "filename":      m["metadata"].get("filename", ""),
-                "standard":      m["metadata"].get("standard", ""),
-                "dal_level":     m["metadata"].get("dal_level", ""),
+                "chunk_id":       m["id"],
+                "score":          float(m["score"]),
+                "text":           m["metadata"].get("text", ""),
+                "filename":       m["metadata"].get("filename", ""),
+                "standard":       m["metadata"].get("standard", ""),
+                "dal_level":      m["metadata"].get("dal_level", ""),
                 "section_number": m["metadata"].get("section_number", ""),
-                "section_title": m["metadata"].get("section_title", ""),
-                "page_number":   int(m["metadata"].get("page_number", 0)),
+                "section_title":  m["metadata"].get("section_title", ""),
+                "page_number":    int(m["metadata"].get("page_number", 0)),
             }
             for m in resp.get("matches", [])
         ]
@@ -201,7 +222,7 @@ class PineconeClient:
         return total
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Chunk + Embed
     # ------------------------------------------------------------------
 
     def embed_and_chunk(
@@ -212,18 +233,16 @@ class PineconeClient:
         dal_override: str = "ALL",
     ) -> list[dict[str, Any]]:
         """
-        Chunk page texts into sections, generate embeddings, and return
-        records ready for upsert.
+        Chunk page texts into sections, generate embeddings via Pinecone
+        Inference API, and return records ready for upsert.
 
         Args:
             pages:        List of (page_number, text) tuples.
             filename:     Source document filename.
             standard:     Standard name (e.g. 'DO-178C').
-            dal_override: DAL level to tag all chunks with, or 'ALL' for auto-detect.
+            dal_override: DAL level to tag all chunks with, or 'ALL'.
         """
         import re
-
-        self._load_model()
 
         # Section-aware splitting
         full_text = "\n".join(t for _, t in pages)
@@ -239,23 +258,27 @@ class PineconeClient:
                 end = matches[idx + 1].start() if idx + 1 < len(matches) else len(full_text)
                 text = full_text[start:end].strip()
                 if text:
-                    raw.append({"section_number": sec_num, "section_title": sec_title,
-                                "text": text})
+                    raw.append({
+                        "section_number": sec_num,
+                        "section_title": sec_title,
+                        "text": text
+                    })
         else:
             # Fallback: paragraph chunks
             paras = [p.strip() for p in full_text.split("\n\n") if len(p.strip()) > 50]
             for i, p in enumerate(paras):
-                raw.append({"section_number": "N/A", "section_title": "General",
-                            "text": p[:1500]})
+                raw.append({
+                    "section_number": "N/A",
+                    "section_title": "General",
+                    "text": p[:1500]
+                })
 
         if not raw:
             return []
 
-        # Generate embeddings in one batch
+        # Generate embeddings via Pinecone Inference API — no local model!
         texts = [r["text"][:512] for r in raw]
-        embeddings = PineconeClient._model.encode(
-            texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False
-        ).tolist()
+        embeddings = self._embed_batch(texts)
 
         # Auto-detect DAL from text
         dal_kws = {
@@ -300,6 +323,10 @@ class PineconeClient:
             })
 
         return chunks
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def list_documents(self) -> dict[str, Any]:
         """Return index stats from Pinecone."""
