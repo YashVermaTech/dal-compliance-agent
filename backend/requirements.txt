@@ -4,11 +4,9 @@ langchain==0.2.0
 langchain-groq==0.1.6
 langchain-community==0.2.0
 pinecone==3.2.2
-sentence-transformers==2.7.0
 PyPDF2==3.0.1
 python-multipart==0.0.9
 python-dotenv==1.0.0
 pydantic==2.5.0
 groq==0.8.0
 tenacity==8.2.3
-numpy==1.26.4
