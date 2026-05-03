@@ -173,6 +173,16 @@ def _parse_agent_json(text: str) -> dict:
     return {}
 
 
+def _extract_citations(text: str) -> list[dict[str, str]]:
+    """Parse citation lines from query_compliance tool output."""
+    pattern = re.compile(r"\[(\d+)\]\s+([^—\n]+)\s+—\s+Section\s+([^,\n]+),\s+Page\s+(\d+)")
+    return [
+        {"index": m.group(1), "document": m.group(2).strip(),
+         "section": m.group(3).strip(), "page": m.group(4)}
+        for m in pattern.finditer(text)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -204,7 +214,7 @@ async def health() -> dict:
         from groq import Groq
         client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
         models = client.models.list()
-        groq_model = os.environ.get("GROQ_MODEL", "llama3-70b-8192")
+        groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
         model_ids = [m.id for m in models.data]
         components["groq"] = {
             "status": "ok" if groq_model in model_ids else "model_unavailable",
@@ -301,9 +311,9 @@ async def list_documents() -> dict:
 async def set_dal(request: SetDALRequest) -> dict:
     """Set the Design Assurance Level for a session."""
     try:
-        from backend.agent.dal_agent import get_agent
-        agent = get_agent(request.session_id)
-        agent.set_dal(request.dal_level)
+        from backend.agent.memory import SessionStore
+        mem = SessionStore.get_or_create(request.session_id)
+        mem.set_dal(request.dal_level)
 
         descriptions = {
             "A": "Catastrophic — 71 objectives — MC/DC coverage required",
@@ -329,28 +339,105 @@ async def query_compliance(request: QueryRequest) -> dict:
     """
     Ask a compliance question. Returns answer + citations + DAL context.
     Supports English and German.
+    No LangChain agent — calls Pinecone directly then sends context to Groq.
+    This avoids tool-call JSON formatting bugs with llama-3.3-70b-versatile.
     """
     try:
-        from backend.agent.dal_agent import get_agent
-        agent = get_agent(request.session_id)
+        from backend.vector_store.pinecone_client import PineconeClient
+        from backend.agent.memory import SessionStore
+        from groq import Groq
 
+        # Get or create session memory
+        mem = SessionStore.get_or_create(request.session_id)
         if request.dal_level:
-            agent.set_dal(request.dal_level.upper())
+            mem.set_dal(request.dal_level.upper())
+        dal = mem.get_dal() or "B"
 
-        result = agent.run(request.question)
+        t0 = time.perf_counter()
 
-        citations = result.get("citations", [])
-        confidence = min(0.95, 0.5 + len(citations) * 0.1 + len(result.get("tool_calls", [])) * 0.05)
+        # Step 1: Search Pinecone directly for relevant context
+        pc = PineconeClient.get_instance()
+        results = pc.semantic_search(
+            query=request.question,
+            dal_level=dal,
+            standard=request.standard,
+            top_k=5,
+        )
+
+        # Build context string from search results
+        if results:
+            context_lines = [f"Relevant compliance documents [DAL-{dal}]:\n"]
+            for i, r in enumerate(results, 1):
+                context_lines.append(
+                    f"[Source {i}] {r['standard']} — Section {r['section_number']}: "
+                    f"{r['section_title']}\n"
+                    f"Document: {r['filename']} | Page: {r['page_number']}\n"
+                    f"{r['text'][:600]}\n"
+                )
+            context_lines.append("\nCITATIONS:")
+            for i, r in enumerate(results, 1):
+                context_lines.append(
+                    f"[{i}] {r['filename']} — Section {r['section_number']}, "
+                    f"Page {r['page_number']} (relevance: {r['score']:.2f})"
+                )
+            context = "\n".join(context_lines)
+        else:
+            context = (
+                "No compliance documents are currently indexed. "
+                "Please upload DO-178C or other standard PDFs via the Document Ingestion tab first."
+            )
+
+        # Step 2: Send context + question to Groq as plain chat completion
+        # No tool calling — direct RAG pattern
+        groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
+        chat = groq_client.chat.completions.create(
+            model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            temperature=0,
+            max_tokens=2048,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the DAL-Aware Compliance Agent — an expert aerospace software "
+                        "certification assistant for DO-178C, DO-254, ARP4761, ARP4754A, and DO-160. "
+                        f"The active Design Assurance Level is DAL-{dal}. "
+                        "Answer questions using only the context provided below. "
+                        "Always cite the section number and page number from the sources. "
+                        "If no context is available, tell the user to upload compliance documents first. "
+                        "Respond in the same language as the question (English or German). "
+                        "Final certification decisions require qualified DER review."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Context:\n{context}\n\nQuestion: {request.question}",
+                },
+            ],
+        )
+
+        answer = chat.choices[0].message.content
+        latency = int((time.perf_counter() - t0) * 1000)
+
+        # Save turn to memory
+        mem.add_turn(request.question, answer)
+
+        # Extract citations from context
+        citations = _extract_citations(context)
+        confidence = min(0.95, 0.5 + len(citations) * 0.1)
+
+        log.info("Query done | session=%s dal=%s | %dms | %d sources",
+                 request.session_id, dal, latency, len(results))
 
         return {
             "session_id": request.session_id,
-            "answer": result.get("answer", ""),
+            "answer": answer,
             "citations": citations,
-            "dal_level": result.get("dal_level"),
+            "dal_level": dal,
             "confidence_score": round(confidence, 2),
-            "latency_ms": result.get("latency_ms", 0),
-            "tool_calls_count": len(result.get("tool_calls", [])),
+            "latency_ms": latency,
+            "tool_calls_count": 1,
         }
+
     except Exception as exc:
         log.error("Query failed: %s", exc, exc_info=True)
         raise HTTPException(500, f"Query failed: {str(exc)[:300]}")
@@ -362,7 +449,6 @@ async def query_compliance(request: QueryRequest) -> dict:
 async def traceability(request: TraceabilityRequest) -> dict:
     """Generate a DO-178C traceability matrix from requirements text."""
     try:
-        from backend.agent.dal_agent import get_agent
         from backend.agent.tools import GenerateTraceabilityMatrixTool
         from backend.agent.memory import SessionStore
 
