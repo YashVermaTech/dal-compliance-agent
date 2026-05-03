@@ -17,7 +17,7 @@ services:
       - key: PINECONE_INDEX_NAME
         value: dal-compliance-index
       - key: GROQ_MODEL
-        value: llama3-70b-8192
+        value: llama-3.3-70b-versatile
       - key: EMBEDDING_MODEL
         value: sentence-transformers/all-MiniLM-L6-v2
       - key: PYTHON_VERSION
