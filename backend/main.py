@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — warm up heavy singletons at startup
+# Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -133,11 +133,10 @@ class ImpactAnalysisRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract text from uploaded PDF
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _extract_pdf(content: bytes) -> list[tuple[int, str]]:
-    """Return list of (page_number, text) from PDF bytes."""
     import io
     reader = PyPDF2.PdfReader(io.BytesIO(content))
     pages = []
@@ -162,19 +161,7 @@ def _detect_standard(filename: str) -> str:
     return "UNKNOWN"
 
 
-def _parse_agent_json(text: str) -> dict:
-    """Extract the first JSON object from agent response text."""
-    m = re.search(r"\{[\s\S]+\}", text)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-    return {}
-
-
 def _extract_citations(text: str) -> list[dict[str, str]]:
-    """Parse citation lines from query_compliance tool output."""
     pattern = re.compile(r"\[(\d+)\]\s+([^—\n]+)\s+—\s+Section\s+([^,\n]+),\s+Page\s+(\d+)")
     return [
         {"index": m.group(1), "document": m.group(2).strip(),
@@ -194,10 +181,8 @@ PREFIX = "/api/v1"
 
 @app.get(f"{PREFIX}/health", tags=["System"])
 async def health() -> dict:
-    """Check connectivity of all components."""
     components: dict[str, Any] = {}
 
-    # Pinecone
     try:
         from backend.vector_store.pinecone_client import PineconeClient
         pc = PineconeClient.get_instance()
@@ -209,7 +194,6 @@ async def health() -> dict:
     except Exception as exc:
         components["pinecone"] = {"status": "error", "detail": str(exc)[:100]}
 
-    # Groq
     try:
         from groq import Groq
         client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
@@ -235,7 +219,6 @@ async def ingest_document(
     dal_level: str = Form(default="ALL"),
     session_id: str = Form(default=""),
 ) -> dict:
-    """Upload and index a compliance PDF into Pinecone."""
     if not file.filename:
         raise HTTPException(400, "No filename provided.")
 
@@ -291,7 +274,6 @@ async def ingest_document(
 
 @app.get(f"{PREFIX}/documents", tags=["Ingestion"])
 async def list_documents() -> dict:
-    """List all indexed documents from Pinecone stats."""
     try:
         from backend.vector_store.pinecone_client import PineconeClient
         pc = PineconeClient.get_instance()
@@ -309,7 +291,6 @@ async def list_documents() -> dict:
 
 @app.post(f"{PREFIX}/set-dal", tags=["Session"])
 async def set_dal(request: SetDALRequest) -> dict:
-    """Set the Design Assurance Level for a session."""
     try:
         from backend.agent.memory import SessionStore
         mem = SessionStore.get_or_create(request.session_id)
@@ -339,15 +320,14 @@ async def query_compliance(request: QueryRequest) -> dict:
     """
     Ask a compliance question. Returns answer + citations + DAL context.
     Supports English and German.
-    No LangChain agent — calls Pinecone directly then sends context to Groq.
-    This avoids tool-call JSON formatting bugs with llama-3.3-70b-versatile.
+    Direct RAG: Pinecone search -> Groq chat completion. No LangChain agent.
     """
     try:
         from backend.vector_store.pinecone_client import PineconeClient
         from backend.agent.memory import SessionStore
         from groq import Groq
 
-        # Get or create session memory
+        # Session memory
         mem = SessionStore.get_or_create(request.session_id)
         if request.dal_level:
             mem.set_dal(request.dal_level.upper())
@@ -355,16 +335,20 @@ async def query_compliance(request: QueryRequest) -> dict:
 
         t0 = time.perf_counter()
 
-        # Step 1: Search Pinecone directly for relevant context
+        # Step 1: Search Pinecone directly
         pc = PineconeClient.get_instance()
-        results = pc.semantic_search(
-            query=request.question,
-            dal_level=dal,
-            standard=request.standard,
-            top_k=5,
-        )
+        try:
+            results = pc.semantic_search(
+                query=request.question,
+                dal_level=dal,
+                standard=request.standard,
+                top_k=5,
+            )
+        except Exception as search_exc:
+            log.warning("Pinecone search failed, continuing without context: %s", search_exc)
+            results = []
 
-        # Build context string from search results
+        # Step 2: Build context string
         if results:
             context_lines = [f"Relevant compliance documents [DAL-{dal}]:\n"]
             for i, r in enumerate(results, 1):
@@ -387,8 +371,7 @@ async def query_compliance(request: QueryRequest) -> dict:
                 "Please upload DO-178C or other standard PDFs via the Document Ingestion tab first."
             )
 
-        # Step 2: Send context + question to Groq as plain chat completion
-        # No tool calling — direct RAG pattern
+        # Step 3: Send context + question to Groq as plain chat completion
         groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
         chat = groq_client.chat.completions.create(
             model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
@@ -418,10 +401,8 @@ async def query_compliance(request: QueryRequest) -> dict:
         answer = chat.choices[0].message.content
         latency = int((time.perf_counter() - t0) * 1000)
 
-        # Save turn to memory
         mem.add_turn(request.question, answer)
 
-        # Extract citations from context
         citations = _extract_citations(context)
         confidence = min(0.95, 0.5 + len(citations) * 0.1)
 
@@ -447,7 +428,6 @@ async def query_compliance(request: QueryRequest) -> dict:
 
 @app.post(f"{PREFIX}/traceability", tags=["Agent"])
 async def traceability(request: TraceabilityRequest) -> dict:
-    """Generate a DO-178C traceability matrix from requirements text."""
     try:
         from backend.agent.tools import GenerateTraceabilityMatrixTool
         from backend.agent.memory import SessionStore
@@ -473,7 +453,6 @@ async def traceability(request: TraceabilityRequest) -> dict:
 
 @app.post(f"{PREFIX}/gap-analysis", tags=["Agent"])
 async def gap_analysis(request: GapAnalysisRequest) -> dict:
-    """Run DO-178C compliance gap analysis on project documents."""
     try:
         from backend.agent.tools import DetectComplianceGapsTool
         from backend.agent.memory import SessionStore
@@ -499,7 +478,6 @@ async def gap_analysis(request: GapAnalysisRequest) -> dict:
 
 @app.post(f"{PREFIX}/impact-analysis", tags=["Agent"])
 async def impact_analysis(request: ImpactAnalysisRequest) -> dict:
-    """Run change impact analysis for a software/hardware modification."""
     try:
         from backend.agent.tools import DALImpactAnalyzerTool
         from backend.agent.memory import SessionStore
