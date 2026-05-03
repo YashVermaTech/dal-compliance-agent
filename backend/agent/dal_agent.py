@@ -1,7 +1,7 @@
 """
 DAL-Aware Compliance Agent — LangChain Agent Orchestrator
 ==========================================================
-Multi-step agent using Groq (llama3-70b-8192) + 6 compliance tools.
+Multi-step agent using Groq (llama-3.3-70b-versatile) + 6 compliance tools.
 Supports English and German. Session memory persists across requests.
 
 Author: Yash Verma — AI Engineer, TU Darmstadt
@@ -25,7 +25,7 @@ from backend.agent.tools import build_tools
 log = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-70b-8192")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 SYSTEM_PROMPT = """You are the DAL-Aware Compliance Agent — an expert aerospace software \
 certification assistant for DO-178C, DO-254, ARP4761, ARP4754A, and DO-160.
@@ -42,6 +42,7 @@ Rules:
 - Never guess requirements — use the query_compliance tool first
 - For ambiguous standard questions, use multi_standard_router first
 - Format complex answers with bullet points or numbered lists
+- When calling tools, always use valid JSON with double quotes
 
 Safety: This system assists engineers. Final certification decisions require qualified \
 DER (Designated Engineering Representative) review.
@@ -171,7 +172,7 @@ class DALComplianceAgent:
         llm = ChatGroq(
             api_key=GROQ_API_KEY,
             model=GROQ_MODEL,
-            temperature=0.1,
+            temperature=0,        # 0 = deterministic, reduces malformed tool call JSON
             max_tokens=4096,
             timeout=60,
         )
@@ -191,7 +192,7 @@ class DALComplianceAgent:
             return_intermediate_steps=True,
         )
 
-        log.info("Executor built for session %s", self.session_id)
+        log.info("Executor built for session %s | model=%s", self.session_id, GROQ_MODEL)
         return self._executor
 
 
